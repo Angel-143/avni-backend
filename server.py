@@ -38,6 +38,10 @@ CORS(app, origins="*")
 def check_auth(req):
     return req.headers.get('Authorization','') == f'Bearer {SECRET_TOKEN}'
 
+@app.route("/")
+def home():
+    return "Avni Backend Running 🚀"
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status':'running','devices':len(devices)})
@@ -198,3 +202,4 @@ if __name__ == '__main__':
     server = WSGIServer(('0.0.0.0', PORT), app, handler_class=WebSocketHandler)
     print(f'Server running on port {PORT}')
     server.serve_forever()
+
