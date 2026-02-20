@@ -4,4 +4,6 @@ gevent
 gunicorn
 gevent-websocket
 python-dotenv
+flask-sock
+
 
