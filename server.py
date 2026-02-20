@@ -16,6 +16,9 @@ from gevent.pywsgi import WSGIServer
 from gevent import monkey
 monkey.patch_all()
 
+# 🔴 IMPORTANT FIX FOR RENDER ASYNC LOOP
+asyncio.set_event_loop(asyncio.new_event_loop())
+
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 SECRET_TOKEN   = 'avni_secret_2024_xyz'
 ADMIN_PASSWORD = 'avni@admin2024'
@@ -32,6 +35,11 @@ CORS(app, origins="*")
 
 def check_auth(req):
     return req.headers.get('Authorization','') == f'Bearer {SECRET_TOKEN}'
+
+# ✅ ROOT ROUTE FIX (Render 404 Fix)
+@app.route('/')
+def home():
+    return "Avni Backend Running Successfully Aslok"
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -131,7 +139,6 @@ def handle_phone(ws, device_id):
             if data is None:
                 break
 
-            # JSON control message
             if isinstance(data, str) and len(data) < 200:
                 try:
                     msg = json.loads(data)
@@ -142,7 +149,6 @@ def handle_phone(ws, device_id):
                 except:
                     pass
 
-            # Audio data — forward to admin listeners
             devices[device_id]['streaming'] = True
             devices[device_id]['last_seen'] = datetime.now().isoformat()
 
