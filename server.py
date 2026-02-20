@@ -14,11 +14,16 @@ from geventwebsocket.handler import WebSocketHandler
 from geventwebsocket import WebSocketError
 from gevent.pywsgi import WSGIServer
 from gevent import monkey
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 monkey.patch_all()
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-SECRET_TOKEN   = 'avni_secret_2024_xyz'
-ADMIN_PASSWORD = 'avni@admin2024'
+
+SECRET_TOKEN   = os.environ.get("SECRET_TOKEN")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 PORT = int(os.environ.get('PORT', 5000))
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
